@@ -14,13 +14,19 @@ namespace VirtualCameraRecorder
         // ── delegates ─────────────────────────────────────────────────
         public Action              OnRecordToggle;
         public Action<int,int,int> OnApplySettings;
-        public Action              OnSnapHere;      // "Snap here" button
+        public Action              OnAimToVessel;   // keep mode, reframe vessel
+        public Action              OnKeepDistance;
+        public Action<bool>        OnHidePartHighlightsChanged;
+        public Action              OnRepairExistingFiles;
 
         // ── state written by ModLoader ─────────────────────────────────
         public bool  IsRecording;
         public bool  IsPipeConnected;
         public float RecordSeconds;
         public float BitrateKBps;
+        public bool  HidePartHighlights;
+        public bool  IsRepairing;
+        public string RepairStatus;
 
         // ── internal UI state ──────────────────────────────────────────
         private Rect    _winRect;
@@ -68,7 +74,7 @@ namespace VirtualCameraRecorder
         {
             _camera   = camera;
             _fovValue = camera.FieldOfView;
-            _winRect  = new Rect(Screen.width - WinW - 20, 20, WinW, 460);
+            _winRect  = new Rect(Screen.width - WinW - 20, 20, WinW, 488);
         }
 
         public void SetCamera(CameraController camera)
@@ -154,21 +160,31 @@ namespace VirtualCameraRecorder
             GUILayout.Label(anchorLabel, _smallLabel);
             GUILayout.FlexibleSpace();
             AnchorMode m = _camera.Mode;
-            bool showSnap = m == AnchorMode.VesselLocal || m == AnchorMode.SurfaceLocked;
-            if (showSnap && GUILayout.Button("Snap here", GUILayout.Height(22)))
-                OnSnapHere?.Invoke();
+            if (GUILayout.Button("Aim", GUILayout.Width(52), GUILayout.Height(22)))
+                OnAimToVessel?.Invoke();
+            if (m == AnchorMode.TargetTrack)
+            {
+                GUILayout.Space(4);
+                if (GUILayout.Button("Keep distance", GUILayout.Width(104), GUILayout.Height(22)))
+                    OnKeepDistance?.Invoke();
+            }
             GUILayout.EndHorizontal();
 
             GUILayout.Space(4);
 
+            if (_camera.Mode == AnchorMode.VesselLocal)
+            {
+                GUILayout.BeginHorizontal();
+                bool lockRot = GUILayout.Toggle(_camera.VesselLockRotation, "Vessel: lock rotation", GUILayout.Height(20));
+                if (lockRot != _camera.VesselLockRotation)
+                    _camera.SetVesselLockRotation(lockRot);
+                GUILayout.FlexibleSpace();
+                GUILayout.Label(lockRot ? "ON" : "OFF", _smallLabel, GUILayout.Width(28));
+                GUILayout.EndHorizontal();
+            }
+
             // analog controls row (single set, no duplicates)
             DrawAnalogControlsRow();
-
-            // presets - usuniete (stala rozdzielczosc 1920x1080 30fps)
-            // GUI.enabled = !IsRecording;
-            // DrawResRow();
-            // DrawFpsRow();
-            // GUI.enabled = true;
 
             GUILayout.Space(6);
 
@@ -190,29 +206,6 @@ namespace VirtualCameraRecorder
             GUIStyle style = isActive ? _activePreset : HighLogic.Skin.button;
             if (GUILayout.Button(label, style, GUILayout.Height(22)) && !isActive)
                 _camera.SetMode(mode);
-        }
-
-        // ── preset rows ────────────────────────────────────────────────
-
-        private void DrawResRow()
-        {
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Res:", _smallLabel, GUILayout.Width(28));
-            GUILayout.Label("1080p", _activePreset);
-            GUILayout.EndHorizontal();
-        }
-
-        private void DrawFpsRow()
-        {
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("FPS:", _smallLabel, GUILayout.Width(28));
-            GUILayout.Label("30", _activePreset);
-            GUILayout.EndHorizontal();
-        }
-
-        private void FireApplySettings()
-        {
-            OnApplySettings?.Invoke(1920, 1080, 30);
         }
 
         // ── record bar ─────────────────────────────────────────────────
@@ -253,6 +246,18 @@ namespace VirtualCameraRecorder
             }
 
             GUILayout.EndHorizontal();
+
+            GUILayout.Space(4);
+            GUILayout.BeginHorizontal();
+            bool prevEnabled = GUI.enabled;
+            GUI.enabled = !IsRecording && !IsRepairing;
+            if (GUILayout.Button(IsRepairing ? "Repairing..." : "Repair existing MP4", GUILayout.Height(22)))
+                OnRepairExistingFiles?.Invoke();
+            GUI.enabled = prevEnabled;
+            GUILayout.EndHorizontal();
+
+            if (!string.IsNullOrEmpty(RepairStatus))
+                GUILayout.Label(RepairStatus, _smallLabel);
         }
 
         // ── mouse input ────────────────────────────────────────────────

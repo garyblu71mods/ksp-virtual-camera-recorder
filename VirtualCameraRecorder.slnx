@@ -1,3 +1,4 @@
 <Solution>
+  <Project Path="BenchmarkSuite1/BenchmarkSuite1.csproj" />
   <Project Path="VirtualCameraRecorder/VirtualCameraRecorder.csproj" Id="a2dc715a-f540-4099-824a-8b2f4c19617e" />
 </Solution>

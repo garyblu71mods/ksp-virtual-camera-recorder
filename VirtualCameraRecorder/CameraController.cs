@@ -1,5 +1,6 @@
 using System;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace VirtualCameraRecorder
 {
@@ -11,6 +12,17 @@ namespace VirtualCameraRecorder
         TargetTrack,    // kamera stoi w miejscu, ale zawsze patrzy na aktywny statek
     }
 
+    internal struct CameraTelemetrySnapshot
+    {
+        public long RenderedFrames;
+        public long SkippedByCadence;
+        public long LateFrames;
+        public float AvgFrameIntervalMs;
+        public float MaxFrameIntervalMs;
+        public float AvgRenderMs;
+        public float MaxRenderMs;
+    }
+
     internal sealed class CameraController : IDisposable
     {
         // ── config ─────────────────────────────────────────────────────
@@ -18,11 +30,13 @@ namespace VirtualCameraRecorder
         public int   TargetHeight = 1080;
         public int   TargetFps    = 30;
         public float FieldOfView  = 40f;
+        public bool  UseMainCameraFinalFrame = true;
 
         // ── public state ───────────────────────────────────────────────
         public RenderTexture OutputTexture { get; private set; }
         public Camera        VirtualCamera { get; private set; }
         public AnchorMode    Mode          = AnchorMode.VesselLocal;
+        public bool          VesselLockRotation = false;
 
         public string AnchorDescription
         {
@@ -67,6 +81,18 @@ namespace VirtualCameraRecorder
         private GameObject    _cameraGO;
         private float         _lastRenderTime;
 
+        private readonly object _telemetryLock = new object();
+        private readonly System.Diagnostics.Stopwatch _telemetryWatch = System.Diagnostics.Stopwatch.StartNew();
+        private int _telemetryFrameSamples;
+        private float _avgFrameIntervalMs;
+        private float _maxFrameIntervalMs;
+        private int _telemetryRenderSamples;
+        private float _avgRenderMs;
+        private float _maxRenderMs;
+        private long _renderedFrames;
+        private long _skippedByCadence;
+        private long _lateFrames;
+
         // Rotation stored as pure quaternion — no gimbal lock, full 360 on all axes.
         private Quaternion _rotation = Quaternion.identity;
         // FPS-style rotation: yaw as a horizontal direction vector (surface-relative),
@@ -79,6 +105,9 @@ namespace VirtualCameraRecorder
         private Vessel        _anchorVessel;
         private CelestialBody _anchorBody;
         private Vector3       _localOffset;   // vessel-local or body-local
+        private Quaternion    _localRotationOffset = Quaternion.identity; // vessel-local camera rotation
+        private bool          _trackDistanceLocked;
+        private float         _trackLockedDistance;
 
         private Vector2 _lookInputTarget;
         private Vector2 _lookInputSmoothed;
@@ -100,11 +129,6 @@ namespace VirtualCameraRecorder
         private Camera _spaceReferenceCamera;
         private Camera _galaxyReferenceCamera;
         private Camera _scaledReferenceCamera;
-
-        private Camera _mainCaptureCamera;
-        private MainCameraCaptureHook _mainCaptureHook;
-        private bool _ownsMainCaptureHook;
-        private bool _captureMainCameraFinalFrame = true;
 
         private static int IncludeLayerIfExists(int mask, string layerName)
         {
@@ -241,11 +265,16 @@ namespace VirtualCameraRecorder
             Quaternion worldRot = _cameraGO.transform.rotation;
 
             Mode = newMode;
+            if (newMode != AnchorMode.TargetTrack)
+                _trackDistanceLocked = false;
             switch (newMode)
             {
                 case AnchorMode.VesselLocal:
                     if (_anchorVessel != null)
+                    {
                         _localOffset = _anchorVessel.transform.InverseTransformPoint(worldPos);
+                        _localRotationOffset = Quaternion.Inverse(_anchorVessel.transform.rotation) * worldRot;
+                    }
                     break;
 
                 case AnchorMode.SurfaceLocked:
@@ -268,6 +297,16 @@ namespace VirtualCameraRecorder
             Debug.Log("[VCR] SetMode: " + newMode + " worldPos=" + worldPos + " (no visible move)");
         }
 
+        public void SetVesselLockRotation(bool enabled)
+        {
+            VesselLockRotation = enabled;
+            if (_cameraGO == null || Mode != AnchorMode.VesselLocal || _anchorVessel == null)
+                return;
+
+            if (enabled)
+                _localRotationOffset = Quaternion.Inverse(_anchorVessel.transform.rotation) * _cameraGO.transform.rotation;
+        }
+
         /// <summary>Teleportuje kamere za statek i zapisuje offset w local-space.</summary>
         public void SnapToVessel(Vessel v)
         {
@@ -278,6 +317,7 @@ namespace VirtualCameraRecorder
             LevelToHorizon(_cameraGO.transform.position, v.transform.position);
             _rotation     = _cameraGO.transform.rotation;
             _anchorVessel = v;
+            _localRotationOffset = Quaternion.Inverse(v.transform.rotation) * _rotation;
             Mode          = AnchorMode.VesselLocal;
             Debug.Log("[VCR] SnapToVessel: " + v.vesselName);
         }
@@ -288,6 +328,7 @@ namespace VirtualCameraRecorder
             if (v == null || _cameraGO == null) return;
             _anchorVessel = v;
             _localOffset  = v.transform.InverseTransformPoint(_cameraGO.transform.position);
+            _localRotationOffset = Quaternion.Inverse(v.transform.rotation) * _cameraGO.transform.rotation;
             Debug.Log("[VCR] ReanchorToVessel: " + v.vesselName + " offset=" + _localOffset);
         }
 
@@ -348,34 +389,75 @@ namespace VirtualCameraRecorder
             _dollyInputSmoothed = Mathf.Lerp(_dollyInputSmoothed, _dollyInputTarget, smooth);
             if (Mathf.Abs(_dollyInputSmoothed) > 0.0001f)
             {
-                float speed = Mathf.Lerp(0.6f, 4.5f, Mathf.Abs(_dollyInputSmoothed));
+                float speed = Mathf.Lerp(3.0f, 20.0f, Mathf.Abs(_dollyInputSmoothed));
                 float dy = -_dollyInputSmoothed * speed * dt * 60f;
-                ApplyDollyDelta(0f, dy, 0.05f);
+                ApplyDollyDelta(0f, dy, 0.08f);
             }
 
             float interval = 1f / Mathf.Max(1, TargetFps);
-            if (Time.realtimeSinceStartup - _lastRenderTime < interval) return;
-            _lastRenderTime = Time.realtimeSinceStartup;
-
-            if (_captureMainCameraFinalFrame)
+            float nowReal = Time.realtimeSinceStartup;
+            float sinceLast = nowReal - _lastRenderTime;
+            if (sinceLast < interval)
             {
-                if (!EnsureMainCaptureHook())
+                lock (_telemetryLock) _skippedByCadence++;
+                return;
+            }
+
+            if (_lastRenderTime > 0f)
+            {
+                float frameIntervalMs = sinceLast * 1000f;
+                lock (_telemetryLock)
                 {
-                    // fallback when Camera.main unavailable
-                    SyncVisualSettingsFromMainCamera();
-                    RenderReferenceSpacePasses(_cameraGO.transform.position, _cameraGO.transform.rotation, VirtualCamera.fieldOfView);
-                    VirtualCamera.enabled = true;
-                    VirtualCamera.Render();
-                    VirtualCamera.enabled = false;
+                    UpdateAverage(ref _avgFrameIntervalMs, ++_telemetryFrameSamples, frameIntervalMs);
+                    if (frameIntervalMs > _maxFrameIntervalMs) _maxFrameIntervalMs = frameIntervalMs;
+                    if (sinceLast > interval * 1.2f) _lateFrames++;
                 }
+            }
+
+            _lastRenderTime = nowReal;
+
+            long renderStartTick = _telemetryWatch.ElapsedTicks;
+
+            // In final-frame capture mode, OutputTexture is filled by a blit from Camera.main.
+            if (UseMainCameraFinalFrame)
+            {
+                UpdateRenderTelemetry(renderStartTick);
                 return;
             }
 
             SyncVisualSettingsFromMainCamera();
-            RenderReferenceSpacePasses(_cameraGO.transform.position, _cameraGO.transform.rotation, VirtualCamera.fieldOfView);
+
+            // Render only VCR-owned passes (clones). Do not render live KSP cameras here,
+            // because mutating their pose/target each frame causes visible flicker in main view.
+            if (_galaxyCamera != null)
+            {
+                Vector3 worldPos = _cameraGO.transform.position;
+                Vector3 scaledPos = ScaledSpace.LocalToScaledSpace(worldPos);
+                _galaxyCamera.transform.position = scaledPos;
+                _galaxyCamera.transform.rotation = _cameraGO.transform.rotation;
+                _galaxyCamera.fieldOfView = VirtualCamera.fieldOfView;
+                _galaxyCamera.enabled = true;
+                _galaxyCamera.Render();
+                _galaxyCamera.enabled = false;
+            }
+
+            if (_spaceCamera != null)
+            {
+                Vector3 worldPos = _cameraGO.transform.position;
+                Vector3 scaledPos = ScaledSpace.LocalToScaledSpace(worldPos);
+                _spaceCamera.transform.position = scaledPos;
+                _spaceCamera.transform.rotation = _cameraGO.transform.rotation;
+                _spaceCamera.fieldOfView = VirtualCamera.fieldOfView;
+                _spaceCamera.enabled = true;
+                _spaceCamera.Render();
+                _spaceCamera.enabled = false;
+            }
+
             VirtualCamera.enabled = true;
             VirtualCamera.Render();
             VirtualCamera.enabled = false;
+
+            UpdateRenderTelemetry(renderStartTick);
         }
 
         private void UpdatePosition()
@@ -388,18 +470,11 @@ namespace VirtualCameraRecorder
                         _cameraGO.transform.position =
                             _anchorVessel.transform.TransformPoint(_localOffset);
 
-                        // Keep vessel in frame while attached to vessel.
-                        Vector3 toVessel = _anchorVessel.transform.position - _cameraGO.transform.position;
-                        if (toVessel.sqrMagnitude > 0.01f)
+                        if (VesselLockRotation)
                         {
-                            Vector3 up = GetSurfaceUp(_cameraGO.transform.position);
-                            Quaternion targetRot = Quaternion.LookRotation(toVessel, up);
-                            _rotation = Quaternion.Slerp(
-                                _cameraGO.transform.rotation,
-                                targetRot,
-                                1f - Mathf.Exp(-12f * Mathf.Max(0.001f, Time.unscaledDeltaTime)));
+                            _rotation = _anchorVessel.transform.rotation * _localRotationOffset;
                             _cameraGO.transform.rotation = _rotation;
-                            SyncFromRotation(_rotation, up);
+                            SyncFromRotation(_rotation, GetSurfaceUp(_cameraGO.transform.position));
                         }
                     }
                     break;
@@ -414,6 +489,14 @@ namespace VirtualCameraRecorder
                     Vessel t = FlightGlobals.ActiveVessel;
                     if (t != null)
                     {
+                        if (_trackDistanceLocked)
+                        {
+                            Vector3 fromTarget = _cameraGO.transform.position - t.transform.position;
+                            if (fromTarget.sqrMagnitude < 0.0001f)
+                                fromTarget = -_cameraGO.transform.forward;
+                            _cameraGO.transform.position = t.transform.position + fromTarget.normalized * _trackLockedDistance;
+                        }
+
                         Vector3 dir = t.transform.position - _cameraGO.transform.position;
                         if (dir.sqrMagnitude > 0.01f)
                         {
@@ -521,12 +604,15 @@ namespace VirtualCameraRecorder
         public void ApplyMouseDelta(float dx, float dy, float sensitivity = 0.3f)
         {
             if (_cameraGO == null) return;
+
             Vector3 surfaceUp = GetSurfaceUp(_cameraGO.transform.position);
             _yawForward = Quaternion.AngleAxis(dx * sensitivity, surfaceUp) * _yawForward;
             // dy > 0 = mysz w dol = kamera patrzy w dol (naturalny FPS)
             _pitch = Mathf.Clamp(_pitch - dy * sensitivity, -89f, 89f);
             _rotation = ComputeRotation(surfaceUp);
             _cameraGO.transform.rotation = _rotation;
+            if (Mode == AnchorMode.VesselLocal && _anchorVessel != null && VesselLockRotation)
+                _localRotationOffset = Quaternion.Inverse(_anchorVessel.transform.rotation) * _rotation;
         }
 
         /// <summary>
@@ -567,6 +653,8 @@ namespace VirtualCameraRecorder
             Vector3 surfaceUp = GetSurfaceUp(_cameraGO.transform.position);
             _rotation = ComputeRotation(surfaceUp);
             _cameraGO.transform.rotation = _rotation;
+            if (Mode == AnchorMode.VesselLocal && _anchorVessel != null)
+                _localRotationOffset = Quaternion.Inverse(_anchorVessel.transform.rotation) * _rotation;
         }
 
         /// <summary>
@@ -579,6 +667,33 @@ namespace VirtualCameraRecorder
             // Przy FOV=40 skalowanie=1; przy FOV=1 ~0.025 (bardzo wolno).
             float fovScale = (VirtualCamera != null ? VirtualCamera.fieldOfView : FieldOfView) / 40f;
             float s        = sensitivity * fovScale;
+
+            if (Mode == AnchorMode.VesselLocal && !VesselLockRotation && _anchorVessel != null && !_anchorVessel.packed)
+            {
+                Vector3 vesselPos = _anchorVessel.transform.position;
+                Vector3 worldOffset = _cameraGO.transform.position - vesselPos;
+                if (worldOffset.sqrMagnitude < 0.01f)
+                    worldOffset = new Vector3(0f, 8f, -20f);
+
+                Vector3 surfaceUp = GetSurfaceUp(_cameraGO.transform.position);
+                float orbitSensitivity = s * 3.5f;
+                Quaternion yaw = Quaternion.AngleAxis(dx * orbitSensitivity, surfaceUp);
+                Quaternion pitch = Quaternion.AngleAxis(-dy * orbitSensitivity, _cameraGO.transform.right);
+                worldOffset = pitch * (yaw * worldOffset);
+
+                _cameraGO.transform.position = vesselPos + worldOffset;
+                _localOffset = _anchorVessel.transform.InverseTransformPoint(_cameraGO.transform.position);
+
+                Vector3 toVessel = vesselPos - _cameraGO.transform.position;
+                if (toVessel.sqrMagnitude > 0.01f)
+                {
+                    _rotation = Quaternion.LookRotation(toVessel, GetSurfaceUp(_cameraGO.transform.position));
+                    _cameraGO.transform.rotation = _rotation;
+                    SyncFromRotation(_rotation, GetSurfaceUp(_cameraGO.transform.position));
+                }
+                return;
+            }
+
             Vector3 delta  = _cameraGO.transform.right * ( dx * s)
                            + _cameraGO.transform.up    * (-dy * s);
             _cameraGO.transform.position += delta;
@@ -617,16 +732,6 @@ namespace VirtualCameraRecorder
 
         public void Dispose()
         {
-            if (_mainCaptureHook != null)
-            {
-                _mainCaptureHook.TargetTexture = null;
-                if (_ownsMainCaptureHook)
-                    UnityEngine.Object.Destroy(_mainCaptureHook);
-                _mainCaptureHook = null;
-                _mainCaptureCamera = null;
-                _ownsMainCaptureHook = false;
-            }
-
             if (_cameraGO != null)
             {
                 UnityEngine.Object.Destroy(_cameraGO);
@@ -744,26 +849,13 @@ namespace VirtualCameraRecorder
             Camera main = Camera.main;
             if (main == null || VirtualCamera == null) return;
 
-            if (_spaceReferenceCamera == null)
-                _spaceReferenceCamera = FindSpaceCamera();
-            if (_galaxyReferenceCamera == null)
-                _galaxyReferenceCamera = FindCameraByKeyword("Galaxy");
-            if (_scaledReferenceCamera == null)
-                _scaledReferenceCamera = FindCameraByKeyword("Scaled");
-
-            // Throttled diagnostics (every ~5s)
-            if (Time.realtimeSinceStartup >= _nextDiagLogTime)
-            {
-                _nextDiagLogTime = Time.realtimeSinceStartup + 5f;
-                LogSpaceDiagnostics("SyncVisualSettingsFromMainCamera");
-            }
-
             VirtualCamera.allowHDR = main.allowHDR;
             VirtualCamera.allowMSAA = main.allowMSAA;
             VirtualCamera.renderingPath = main.renderingPath;
             VirtualCamera.useOcclusionCulling = main.useOcclusionCulling;
             VirtualCamera.depthTextureMode = main.depthTextureMode;
             VirtualCamera.backgroundColor = main.backgroundColor;
+            MirrorCommandBuffers(main, VirtualCamera);
 
             int galaxyMask = BuildGalaxyMask();
             _spaceMask = BuildSpaceMask();
@@ -778,6 +870,7 @@ namespace VirtualCameraRecorder
                 _galaxyCamera.useOcclusionCulling = main.useOcclusionCulling;
                 _galaxyCamera.depthTextureMode = main.depthTextureMode;
                 _galaxyCamera.cullingMask = galaxyMask;
+                MirrorCommandBuffers(main, _galaxyCamera);
             }
 
             if (_spaceCamera != null)
@@ -790,9 +883,8 @@ namespace VirtualCameraRecorder
                 _spaceCamera.useOcclusionCulling = main.useOcclusionCulling;
                 _spaceCamera.depthTextureMode = main.depthTextureMode;
                 _spaceCamera.cullingMask = _spaceMask;
+                MirrorCommandBuffers(main, _spaceCamera);
             }
-
-            EnsureMainCaptureHook();
         }
 
         private Camera FindSpaceCamera()
@@ -1007,30 +1099,131 @@ namespace VirtualCameraRecorder
             }
         }
 
-        private bool EnsureMainCaptureHook()
+        public void AimNearVessel(Vessel v)
         {
-            if (OutputTexture == null) return false;
+            if (v == null || _cameraGO == null) return;
 
-            Camera main = Camera.main;
-            if (main == null) return false;
+            // Keep current mode, move camera near vessel and look at it.
+            Vector3 desired = v.transform.TransformPoint(new Vector3(0f, 6f, -14f));
+            _cameraGO.transform.position = desired;
 
-            if (_mainCaptureCamera != main || _mainCaptureHook == null)
+            Vector3 up = GetSurfaceUp(_cameraGO.transform.position);
+            Vector3 dir = v.transform.position - _cameraGO.transform.position;
+            if (dir.sqrMagnitude > 0.01f)
             {
-                _mainCaptureCamera = main;
-                _mainCaptureHook = main.GetComponent<MainCameraCaptureHook>();
-                if (_mainCaptureHook == null)
-                {
-                    _mainCaptureHook = main.gameObject.AddComponent<MainCameraCaptureHook>();
-                    _ownsMainCaptureHook = true;
-                }
-                else
-                {
-                    _ownsMainCaptureHook = false;
-                }
+                _rotation = Quaternion.LookRotation(dir, up);
+                _cameraGO.transform.rotation = _rotation;
+                SyncFromRotation(_rotation, up);
             }
 
-            _mainCaptureHook.TargetTexture = OutputTexture;
-            return true;
+            // Re-anchor offsets for modes that use them, but do NOT change Mode.
+            switch (Mode)
+            {
+                case AnchorMode.VesselLocal:
+                    _anchorVessel = v;
+                    _localOffset = v.transform.InverseTransformPoint(_cameraGO.transform.position);
+                    break;
+                case AnchorMode.SurfaceLocked:
+                    _anchorBody = FlightGlobals.currentMainBody;
+                    if (_anchorBody != null)
+                        _localOffset = _anchorBody.transform.InverseTransformPoint(_cameraGO.transform.position);
+                    break;
+            }
+        }
+
+        public void KeepTrackDistance(Vessel v)
+        {
+            if (v == null || _cameraGO == null) return;
+            if (Mode != AnchorMode.TargetTrack) return;
+
+            _trackLockedDistance = Mathf.Max(0.5f, Vector3.Distance(_cameraGO.transform.position, v.transform.position));
+            _trackDistanceLocked = true;
+
+            Vector3 up = GetSurfaceUp(_cameraGO.transform.position);
+            Vector3 look = v.transform.position - _cameraGO.transform.position;
+            if (look.sqrMagnitude > 0.01f)
+            {
+                _rotation = Quaternion.LookRotation(look, up);
+                _cameraGO.transform.rotation = _rotation;
+                SyncFromRotation(_rotation, up);
+            }
+        }
+
+        private static float EstimateVesselRadius(Vessel v)
+        {
+            if (v == null || v.parts == null || v.parts.Count == 0) return 6f;
+
+            Vector3 center = v.transform.position;
+            float maxSq = 36f;
+
+            for (int i = 0; i < v.parts.Count; i++)
+            {
+                Part p = v.parts[i];
+                if (p == null) continue;
+
+                Vector3 d = p.transform.position - center;
+                float sq = d.sqrMagnitude;
+                if (sq > maxSq) maxSq = sq;
+            }
+
+            return Mathf.Clamp(Mathf.Sqrt(maxSq), 3f, 250f);
+        }
+
+        private static void MirrorCommandBuffers(Camera src, Camera dst)
+        {
+            if (src == null || dst == null) return;
+
+            Array events = Enum.GetValues(typeof(CameraEvent));
+            for (int i = 0; i < events.Length; i++)
+            {
+                CameraEvent ev = (CameraEvent)events.GetValue(i);
+                var existing = dst.GetCommandBuffers(ev);
+                for (int j = 0; j < existing.Length; j++)
+                    dst.RemoveCommandBuffer(ev, existing[j]);
+
+                var srcBuf = src.GetCommandBuffers(ev);
+                for (int j = 0; j < srcBuf.Length; j++)
+                    dst.AddCommandBuffer(ev, srcBuf[j]);
+            }
+        }
+
+        public CameraTelemetrySnapshot GetTelemetrySnapshot()
+        {
+            lock (_telemetryLock)
+            {
+                return new CameraTelemetrySnapshot
+                {
+                    RenderedFrames = _renderedFrames,
+                    SkippedByCadence = _skippedByCadence,
+                    LateFrames = _lateFrames,
+                    AvgFrameIntervalMs = _avgFrameIntervalMs,
+                    MaxFrameIntervalMs = _maxFrameIntervalMs,
+                    AvgRenderMs = _avgRenderMs,
+                    MaxRenderMs = _maxRenderMs,
+                };
+            }
+        }
+
+        private void UpdateRenderTelemetry(long renderStartTick)
+        {
+            float renderMs = TicksToMs(_telemetryWatch.ElapsedTicks - renderStartTick);
+            lock (_telemetryLock)
+            {
+                _renderedFrames++;
+                UpdateAverage(ref _avgRenderMs, ++_telemetryRenderSamples, renderMs);
+                if (renderMs > _maxRenderMs) _maxRenderMs = renderMs;
+            }
+        }
+
+        private static float TicksToMs(long ticks)
+        {
+            return (float)(ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        private static void UpdateAverage(ref float avg, int samples, float value)
+        {
+            if (samples <= 1) avg = value;
+            else avg += (value - avg) / samples;
         }
     }
 }

@@ -1,92 +1,99 @@
 # VirtualCameraRecorder — KSP Mod
 
-A cinematic camera recorder for Kerbal Space Program 1.x.  
-Place a free-floating or vessel-anchored virtual camera anywhere in the scene and record to MP4 (H.264).
+A cinematic camera recorder for Kerbal Space Program 1.x.
 
 ---
 
 ## Requirements
 
-- Kerbal Space Program 1.x (tested on Unity 5 / Mono)
-- **FFmpeg** — must be placed in the mod's `Plugins` folder as `ffmpeg.exe`  
-  Download: https://ffmpeg.org/download.html → Windows builds (e.g. gyan.dev or BtbN)
+- Kerbal Space Program 1.x (Unity/Mono runtime)
 
 ---
 
 ## Installation
 
-1. Copy the `VirtualCameraRecorder` folder into your KSP `GameData` folder:
+1. Extract the release ZIP into your KSP folder so files end up here:
    ```
    KerbalSpaceProgram/
    └── GameData/
        └── VirtualCameraRecorder/
            └── Plugins/
                ├── VirtualCameraRecorder.dll
-               └── ffmpeg.exe          ← place here!
+               └── ffmpeg.exe
    ```
-2. Launch KSP and load a **Flight** scene.
+2. Launch KSP and enter a **Flight** scene.
 
 ---
 
-## Opening the Window
+## Open / Close Window
 
-Click the **camera icon** in the KSP toolbar (top-right of screen) to show/hide the VCR window.
+Click the **camera icon** in the stock KSP toolbar (top-right).
 
 ---
 
 ## Camera Modes
 
-| Button | Description |
-|--------|-------------|
-| **Vessel** | Camera follows the active vessel (offset in vessel-local space) |
-| **Free** | Camera floats freely — stays where you left it |
-| **Surface** | Camera rotates with the planet surface |
-| **Track** | Camera stays in place but always looks at the active vessel |
+| Mode | Behavior |
+|------|----------|
+| **Vessel** | Camera stays attached to vessel offset and keeps vessel in frame |
+| **Free** | Camera position is fully free |
+| **Surface** | Camera position follows planet-surface anchor |
+| **Track** | Camera stays in place and smoothly tracks active vessel |
 
-Use **Snap here** to anchor the camera at its current world position relative to the vessel or surface.
+Buttons:
+- **Snap here**: re-anchor current position for Vessel/Surface modes
+- **Aim**: quickly reset camera near active vessel (same framing style as startup)
 
 ---
 
-## Camera Controls
+## Controls
 
-All controls work inside the **preview window**:
+### Analog controls (in window)
+- **Look joystick** (LMB drag): smooth look/rotation
+- **Pan joystick** (LMB drag): smooth pan
+- **Dolly slider**: fast forward/back movement
 
-| Input | Action |
-|-------|--------|
-| **LMB drag** | Rotate (yaw + pitch) |
-| **RMB drag** | Pan (up / down / left / right) |
-| **MMB drag** | Dolly (forward / back / strafe) |
-| **MMB + RMB drag** | Roll |
-| **Scroll wheel** | Zoom (FOV) |
+### Preview mouse controls
+- **LMB drag**: rotate
+- **RMB drag**: pan
+- **MMB drag**: dolly
+- **MMB + RMB drag**: roll
+- **Scroll**: zoom (FOV)
 
 ---
 
 ## Recording
 
-1. Click **● REC** to start recording — a new MP4 file is created immediately.
-2. The timer and bitrate indicator show recording is active.
-3. Click **■ STOP** to stop — FFmpeg finalises the file automatically.
+1. Click **● REC** to start.
+2. Click **■ STOP** to finish and finalize MP4.
 
-Recordings are saved to:
+Output path:
 ```
 KerbalSpaceProgram/Recordings/vcr_YYYY-MM-DD_HH-mm-ss.mp4
 ```
 
-Video format: **1920×1080, 30 fps, H.264, yuv420p** — playable in VLC, Windows Media Player, etc.
+Current encoder settings:
+- Resolution: **1920×1080**
+- FPS: **30**
+- Codec: **H.264 (libx264)**
+- x264 quality: **preset slow, CRF 17, profile high**
+- Pixel format: **yuv420p**
+
+The recorder keeps real-time duration (no speed-up): when the game renders fewer frames than target FPS, frames are duplicated to preserve correct timeline length.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| No video file created | Make sure `ffmpeg.exe` is in `GameData\VirtualCameraRecorder\Plugins\` |
-| Black preview | Switch to Flight scene and wait for vessel to load |
-| KSP log errors | Check `KSP_Data/output_log.txt` for `[VCR]` entries |
-| FFmpeg errors | Check `Recordings/ffmpeg_lastrun.log` |
+| Problem | What to check |
+|---------|----------------|
+| No output file | Verify ZIP was extracted to `GameData\VirtualCameraRecorder\Plugins\` |
+| UI opens but no image | Make sure you are in Flight scene and vessel is loaded |
+| Build/playback issues | Check `Recordings/ffmpeg_lastrun.log` |
+| Runtime issues | Check `KSP_Data/output_log.txt` for `[VCR]` logs |
 
 ---
 
 ## License
 
-MIT — free to use, modify and redistribute.
+MIT

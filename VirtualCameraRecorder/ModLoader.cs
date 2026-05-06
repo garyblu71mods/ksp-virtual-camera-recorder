@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Threading;
+using System.Collections;
+using System.Collections.Generic;
 using KSP.UI.Screens;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
@@ -16,6 +18,8 @@ namespace VirtualCameraRecorder
     [KSPAddon(KSPAddon.Startup.Flight, false)]
     public sealed class ModLoader : MonoBehaviour
     {
+        private const string FixedFfmpegPreset = "ultrafast";
+
         // ── default config ─────────────────────────────────────────────
         // ffmpeg.exe lives next to the mod DLL:
         //   GameData\VirtualCameraRecorder\Plugins\ffmpeg.exe
@@ -50,6 +54,8 @@ namespace VirtualCameraRecorder
         private CameraWindow     _camWin;
         private FrameStreamer    _streamer;
         private Process          _ffmpeg;
+        private string           _activeOutputPath;
+        private MainCameraBlitCapture _mainBlitCapture;
 
         private bool  _initialised;
         private float _nextSetUpAttempt; // realtime seconds – cooldown between retries
@@ -60,6 +66,10 @@ namespace VirtualCameraRecorder
         private long  _lastBytesSample;
         private float _lastBytesSampleTime;
         private float _bitrateKBps;
+        private float _nextPerfLogTime;
+        private volatile bool _repairRunning;
+        private string _repairStatus;
+        private int _vesselSwitchCheckToken;
 
         // ── AppLauncher button ─────────────────────────────────────────
         private ApplicationLauncherButton _appButton;
@@ -115,10 +125,33 @@ namespace VirtualCameraRecorder
                 return;
             }
 
+            // Reattach if camera stack changed (mods/scene transitions)
+            EnsureMainCameraCapture();
+
+            SuppressPartHighlights();
+
             _camCtrl.Tick();
-            _streamer?.RequestFrame();   // zawsze — bufor gotowy gdy REC zostanie klikniety
+            _streamer?.RequestFrame();
 
             UpdateWindowState();
+        }
+
+        private static void SuppressPartHighlights()
+        {
+            Vessel v = FlightGlobals.ActiveVessel;
+            if (v == null || v.parts == null) return;
+
+            for (int i = 0; i < v.parts.Count; i++)
+            {
+                Part p = v.parts[i];
+                if (p == null) continue;
+                try
+                {
+                    p.SetHighlight(false, false);
+                    p.SetHighlightDefault();
+                }
+                catch { }
+            }
         }
 
         private void OnGUI()
@@ -133,9 +166,15 @@ namespace VirtualCameraRecorder
             UnsubscribeEvents();
             RemoveAppLauncherButton();
 
-            // Natychmiast zatrzymaj nagrywanie i zabij FFmpeg — nie czekaj
-            _recording = false;
-            KillFFmpeg();
+            // Priorytet: domknij plik nagrania nawet podczas niszczenia obiektu/sceny.
+            if (_recording)
+                StopRecordingAndWait(15000);
+            else if (_ffmpeg != null)
+            {
+                Process ffmpegToWait = _ffmpeg;
+                _ffmpeg = null;
+                FinalizeAndDisposeFFmpeg(ffmpegToWait, 10000);
+            }
 
             // Dispose streamera — odblokuje wszystkie wiszące wątki tła
             if (_streamer != null)
@@ -185,7 +224,45 @@ namespace VirtualCameraRecorder
             // we keep tracking it. If the user wants to anchor to the new active
             // vessel they press "Snap here" in the window.
             if (!_initialised) return;
-            // If previous anchor is gone/unloaded, silently freeze in place.
+
+            // Do not stop immediately on event: vessel switches can report transient packed/unloaded states.
+            if (_recording)
+            {
+                int token = ++_vesselSwitchCheckToken;
+                StartCoroutine(ValidateVesselSwitchForFinalize(v, token));
+            }
+        }
+
+        private IEnumerator ValidateVesselSwitchForFinalize(Vessel switchedTo, int token)
+        {
+            // Let KSP settle vessel state after switch.
+            yield return new WaitForSecondsRealtime(1.0f);
+
+            if (!_recording || token != _vesselSwitchCheckToken)
+                yield break;
+
+            Vessel active = FlightGlobals.ActiveVessel;
+            Vessel v = active ?? switchedTo;
+
+            bool newActiveOutOfRange =
+                (v == null) ||
+                v.packed ||
+                !v.loaded ||
+                v.gameObject == null;
+
+            bool anchorOutOfRange = (_camCtrl != null && !_camCtrl.IsAnchorLoaded);
+
+            // Finalize only when the new active vessel is still out-of-range after delay
+            // and anchor context is also unavailable.
+            if (newActiveOutOfRange && anchorOutOfRange)
+            {
+                Debug.Log("[VCR] Vessel change sustained out-of-range state — finalizing recording.");
+                StopRecordingAndWait(15000);
+            }
+            else
+            {
+                Debug.Log("[VCR] Vessel change remained in render range — keeping recording active.");
+            }
         }
 
         private void OnLevelWasLoaded(GameScenes scene)
@@ -203,14 +280,16 @@ namespace VirtualCameraRecorder
             if (_initialised) { Debug.Log("[VCR] SetUp skipped — already initialised."); return; }
             try
             {
-                Debug.Log("[VCR] Creating CameraController 1280x720 30fps...");
+                Debug.Log("[VCR] Creating CameraController 1920x1080 30fps...");
                 _camCtrl = new CameraController
                 {
-                    TargetWidth  = 1280,
-                    TargetHeight = 720,
+                    TargetWidth  = 1920,
+                    TargetHeight = 1080,
                     TargetFps    = 30,
+                    UseMainCameraFinalFrame = false,
                 };
                 _camCtrl.Initialise();
+                EnsureMainCameraCapture();
                 Debug.Log("[VCR] CameraController OK.");
 
                 if (FlightGlobals.ActiveVessel != null)
@@ -228,10 +307,15 @@ namespace VirtualCameraRecorder
                 _camWin.Initialise(_camCtrl);
                 _camWin.OnRecordToggle  = ToggleRecording;
                 _camWin.OnApplySettings = OnWindowApplySettings;
-                _camWin.OnSnapHere      = () =>
+                _camWin.OnAimToVessel = () =>
                 {
-                    if (_camCtrl != null)
-                        _camCtrl.SnapHere(FlightGlobals.ActiveVessel);
+                    if (_camCtrl != null && FlightGlobals.ActiveVessel != null)
+                        _camCtrl.AimNearVessel(FlightGlobals.ActiveVessel);
+                };
+                _camWin.OnKeepDistance = () =>
+                {
+                    if (_camCtrl != null && FlightGlobals.ActiveVessel != null)
+                        _camCtrl.KeepTrackDistance(FlightGlobals.ActiveVessel);
                 };
                 Debug.Log("[VCR] CameraWindow OK. visible=" + _camWin.IsVisible);
 
@@ -255,7 +339,19 @@ namespace VirtualCameraRecorder
         {
             _initialised = false;
 
-            if (_recording) StopRecording();
+            if (_recording) StopRecordingAndWait(15000);
+            else if (_ffmpeg != null)
+            {
+                Process ffmpegToWait = _ffmpeg;
+                _ffmpeg = null;
+                FinalizeAndDisposeFFmpeg(ffmpegToWait, 10000);
+            }
+
+            if (_mainBlitCapture != null)
+            {
+                UnityEngine.Object.Destroy(_mainBlitCapture);
+                _mainBlitCapture = null;
+            }
 
             _streamer?.Dispose();
             _streamer = null;
@@ -264,6 +360,37 @@ namespace VirtualCameraRecorder
             _camCtrl = null;
 
             _camWin = null;
+        }
+
+        private void EnsureMainCameraCapture()
+        {
+            if (_camCtrl == null) return;
+
+            // If final-frame mode is disabled, remove hook to avoid hijacking preview.
+            if (!_camCtrl.UseMainCameraFinalFrame)
+            {
+                if (_mainBlitCapture != null)
+                {
+                    UnityEngine.Object.Destroy(_mainBlitCapture);
+                    _mainBlitCapture = null;
+                }
+                return;
+            }
+
+            Camera main = Camera.main;
+            if (main == null) return;
+
+            if (_mainBlitCapture == null || _mainBlitCapture.gameObject != main.gameObject)
+            {
+                if (_mainBlitCapture != null)
+                    UnityEngine.Object.Destroy(_mainBlitCapture);
+
+                _mainBlitCapture = main.GetComponent<MainCameraBlitCapture>();
+                if (_mainBlitCapture == null)
+                    _mainBlitCapture = main.gameObject.AddComponent<MainCameraBlitCapture>();
+            }
+
+            _mainBlitCapture.Target = _camCtrl.OutputTexture;
         }
 
         // ── recording ──────────────────────────────────────────────────
@@ -299,6 +426,7 @@ namespace VirtualCameraRecorder
                 _recordStartTime     = Time.realtimeSinceStartup;
                 _lastBytesSample     = 0;
                 _lastBytesSampleTime = Time.realtimeSinceStartup;
+                _nextPerfLogTime     = Time.realtimeSinceStartup + 2f;
                 Debug.Log("[VCR] Recording started. PipeName=" + streamer.PipeName);
             })
             {
@@ -311,6 +439,7 @@ namespace VirtualCameraRecorder
         {
             if (!_recording) return;
             _recording = false;
+            LogRecordingPerf("final");
 
             // Zamknij pipe — to wysyla EOF do ffmpeg, ktory sam zapisze moov atom
             _streamer?.StopStreaming();
@@ -322,25 +451,7 @@ namespace VirtualCameraRecorder
             {
                 var t = new Thread(() =>
                 {
-                    try
-                    {
-                        // daj ffmpeg 10s na finalizacje pliku
-                        if (!ffmpegToWait.WaitForExit(10000))
-                        {
-                            Debug.LogWarning("[VCR] FFmpeg did not finish in 10s — killing.");
-                            try { ffmpegToWait.Kill(); } catch { }
-                            ffmpegToWait.WaitForExit(2000);
-                        }
-                        Debug.Log("[VCR] FFmpeg exited with code " + ffmpegToWait.ExitCode);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogWarning("[VCR] FFmpeg wait error: " + ex.Message);
-                    }
-                    finally
-                    {
-                        ffmpegToWait.Dispose();
-                    }
+                    FinalizeAndDisposeFFmpeg(ffmpegToWait, 10000);
                 })
                 {
                     IsBackground = true,
@@ -352,6 +463,60 @@ namespace VirtualCameraRecorder
             Debug.Log("[VCR] Recording stop requested — waiting for FFmpeg to finalise file.");
         }
 
+        private void StopRecordingAndWait(int timeoutMs)
+        {
+            if (!_recording) return;
+
+            _recording = false;
+            LogRecordingPerf("final");
+            _streamer?.StopStreaming();
+
+            Process ffmpegToWait = _ffmpeg;
+            _ffmpeg = null;
+            if (ffmpegToWait != null)
+                FinalizeAndDisposeFFmpeg(ffmpegToWait, timeoutMs);
+
+            Debug.Log("[VCR] Recording stopped and finalised synchronously.");
+        }
+
+        private void FinalizeAndDisposeFFmpeg(Process ffmpegToWait, int timeoutMs)
+        {
+            int exitCode = int.MinValue;
+            bool exited = false;
+            try
+            {
+                // Daj ffmpeg czas na finalizacje pliku.
+                exited = ffmpegToWait.WaitForExit(timeoutMs);
+                if (!exited)
+                {
+                    Debug.LogWarning("[VCR] FFmpeg did not finish in " + timeoutMs + "ms — requesting soft quit.");
+                    try { ffmpegToWait.StandardInput.WriteLine("q"); } catch { }
+                    exited = ffmpegToWait.WaitForExit(5000);
+                }
+
+                if (exited)
+                {
+                    exitCode = ffmpegToWait.ExitCode;
+                    Debug.Log("[VCR] FFmpeg exited with code " + exitCode);
+                }
+                else
+                {
+                    Debug.LogWarning("[VCR] FFmpeg still running after soft-close attempts; not killing process.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[VCR] FFmpeg wait error: " + ex.Message);
+            }
+            finally
+            {
+                ffmpegToWait.Dispose();
+            }
+
+            if (exited && exitCode != 0)
+                TryRepairActiveOutput();
+        }
+
         // ── window → ModLoader callbacks ├─────────────────────────────
 
         private void OnWindowApplySettings(int w, int h, int fps)
@@ -359,7 +524,6 @@ namespace VirtualCameraRecorder
             bool wasRecording = _recording;
             if (wasRecording) StopRecording();
 
-            // Rebuild camera + streamer with new resolution / fps.
             _streamer?.Dispose();
             _camCtrl?.Dispose();
 
@@ -368,8 +532,10 @@ namespace VirtualCameraRecorder
                 TargetWidth  = w,
                 TargetHeight = h,
                 TargetFps    = fps,
+                UseMainCameraFinalFrame = false,
             };
             _camCtrl.Initialise();
+            EnsureMainCameraCapture();
 
             if (FlightGlobals.ActiveVessel != null)
                 _camCtrl.SnapToVessel(FlightGlobals.ActiveVessel);
@@ -394,7 +560,6 @@ namespace VirtualCameraRecorder
                 ? Time.realtimeSinceStartup - _recordStartTime
                 : 0f;
 
-            // Rolling bitrate sample every second.
             if (_recording && _streamer != null)
             {
                 float now = Time.realtimeSinceStartup;
@@ -413,6 +578,75 @@ namespace VirtualCameraRecorder
             }
 
             _camWin.BitrateKBps = _bitrateKBps;
+
+            if (_recording && Time.realtimeSinceStartup >= _nextPerfLogTime)
+            {
+                _nextPerfLogTime = Time.realtimeSinceStartup + 2f;
+                LogRecordingPerf("live");
+            }
+        }
+
+        private void LogRecordingPerf(string tag)
+        {
+            if (_camCtrl == null || _streamer == null) return;
+
+            CameraTelemetrySnapshot cam = _camCtrl.GetTelemetrySnapshot();
+            StreamerTelemetrySnapshot str = _streamer.GetTelemetrySnapshot();
+
+            float now = Time.realtimeSinceStartup;
+            float recSec = Mathf.Max(0.001f, now - _recordStartTime);
+            float expectedFrames = recSec * Mathf.Max(1, _camCtrl.TargetFps);
+
+            float camLatePct = cam.RenderedFrames > 0
+                ? (100f * cam.LateFrames / cam.RenderedFrames)
+                : 0f;
+            float dupPct = str.FramesWritten > 0
+                ? (100f * str.DuplicateFrames / str.FramesWritten)
+                : 0f;
+            float missPct = expectedFrames > 0f
+                ? (100f * Mathf.Max(0f, expectedFrames - cam.RenderedFrames) / expectedFrames)
+                : 0f;
+
+            string bottleneck;
+            float frameBudgetMs = 1000f / Mathf.Max(1, _camCtrl.TargetFps);
+            if (str.WriteAvgMs > frameBudgetMs * 0.7f || str.LateCadenceFrames > cam.LateFrames)
+                bottleneck = "pipe/encoder pressure";
+            else if (str.ReadbackAvgMs > frameBudgetMs * 0.5f || str.ReadbackErrors > 0)
+                bottleneck = "GPU readback";
+            else if (cam.AvgRenderMs > frameBudgetMs * 0.7f || camLatePct > 10f)
+                bottleneck = "render cadence";
+            else
+                bottleneck = "mixed/unknown";
+
+            Debug.Log(string.Format(
+                "[VCR][PERF:{0}] t={1:F1}s expected={2:F0} cam={3} miss={4:F1}% late={5:F1}% interval(avg/max)={6:F2}/{7:F2}ms render(avg/max)={8:F2}/{9:F2}ms | readback(avg/max)={10:F2}/{11:F2}ms err={12} copy(avg/max)={13:F2}/{14:F2}ms publish(avg/max)={15:F2}/{16:F2}ms callback(avg/max)={17:F2}/{18:F2}ms | pipeWrite(avg/max)={19:F2}/{20:F2}ms dup={21:F1}% frameAge(avg/max)={22:F2}/{23:F2}ms cadenceLate={24} | out={25:F2}MB/s suspect={26}",
+                tag,
+                recSec,
+                expectedFrames,
+                cam.RenderedFrames,
+                missPct,
+                camLatePct,
+                cam.AvgFrameIntervalMs,
+                cam.MaxFrameIntervalMs,
+                cam.AvgRenderMs,
+                cam.MaxRenderMs,
+                str.ReadbackAvgMs,
+                str.ReadbackMaxMs,
+                str.ReadbackErrors,
+                str.ReadbackCopyAvgMs,
+                str.ReadbackCopyMaxMs,
+                str.ReadbackPublishAvgMs,
+                str.ReadbackPublishMaxMs,
+                str.ReadbackCallbackAvgMs,
+                str.ReadbackCallbackMaxMs,
+                str.WriteAvgMs,
+                str.WriteMaxMs,
+                dupPct,
+                str.FrameAgeAvgMs,
+                str.FrameAgeMaxMs,
+                str.LateCadenceFrames,
+                _bitrateKBps / 1024f,
+                bottleneck));
         }
 
         // ── FFmpeg process management ──────────────────────────────────
@@ -423,13 +657,16 @@ namespace VirtualCameraRecorder
             try
             {
                 string outputPath = NextOutputPath();
+                _activeOutputPath = outputPath;
+                string preset = FixedFfmpegPreset;
 
                 string args = string.Format(
                     "-f rawvideo -pixel_format rgb24 -video_size {0}x{1} -framerate {2} " +
                     "-i \\\\.\\pipe\\{3} " +
-                    "-c:v libx264 -pix_fmt yuv420p -preset fast -vf vflip -y \"{4}\"",
+                    "-c:v libx264 -preset {4} -crf 17 -profile:v high -pix_fmt yuv420p -vf vflip -movflags +frag_keyframe+empty_moov+default_base_moof+faststart -y \"{5}\"",
                     _camCtrl.TargetWidth, _camCtrl.TargetHeight,
                     _camCtrl.TargetFps,  _streamer.PipeName,
+                    preset,
                     outputPath);
 
                 string logPath = Path.Combine(RecordingsDir, "ffmpeg_lastrun.log");
@@ -440,13 +677,14 @@ namespace VirtualCameraRecorder
                     CreateNoWindow         = true,
                     RedirectStandardError  = true,
                     RedirectStandardOutput = true,
+                    RedirectStandardInput  = true,
                 };
                 _ffmpeg = Process.Start(psi);
                 _ffmpeg.ErrorDataReceived  += (s, ev) => { if (ev.Data != null) File.AppendAllText(logPath, ev.Data + "\n"); };
                 _ffmpeg.OutputDataReceived += (s, ev) => { if (ev.Data != null) File.AppendAllText(logPath, ev.Data + "\n"); };
                 _ffmpeg.BeginErrorReadLine();
                 _ffmpeg.BeginOutputReadLine();
-                Debug.Log("[VCR] FFmpeg launched (PID " + _ffmpeg.Id + "). Log: " + logPath);
+                Debug.Log("[VCR] FFmpeg launched (PID " + _ffmpeg.Id + ") preset=" + preset + ". Log: " + logPath);
             }
             catch (Exception ex)
             {
@@ -458,9 +696,177 @@ namespace VirtualCameraRecorder
         private void KillFFmpeg()
         {
             if (_ffmpeg == null) return;
-            try { if (!_ffmpeg.HasExited) _ffmpeg.Kill(); }
-            catch (Exception ex) { Debug.LogWarning("[VCR] KillFFmpeg: " + ex.Message); }
+            try
+            {
+                if (!_ffmpeg.HasExited)
+                {
+                    try { _ffmpeg.StandardInput.WriteLine("q"); } catch { }
+                    _ffmpeg.WaitForExit(5000);
+                }
+            }
+            catch (Exception ex) { Debug.LogWarning("[VCR] KillFFmpeg(soft): " + ex.Message); }
             finally { _ffmpeg.Dispose(); _ffmpeg = null; }
+        }
+
+        private void TryRepairActiveOutput()
+        {
+            string inputPath = _activeOutputPath;
+            _activeOutputPath = null;
+
+            if (string.IsNullOrEmpty(inputPath) || !File.Exists(inputPath))
+                return;
+
+            try
+            {
+                RepairFileInPlace(inputPath, 10000);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[VCR] Recovery exception: " + ex.Message);
+            }
+        }
+
+        private void RepairExistingRecordings()
+        {
+            if (_repairRunning)
+            {
+                _repairStatus = "Repair already running...";
+                return;
+            }
+
+            _repairRunning = true;
+            _repairStatus = "Scanning recordings...";
+
+            new Thread(() =>
+            {
+                int checkedCount = 0;
+                int repairedCount = 0;
+                int failedCount = 0;
+                try
+                {
+                    if (!Directory.Exists(RecordingsDir))
+                    {
+                        _repairStatus = "Recordings folder not found.";
+                        return;
+                    }
+
+                    string[] files = Directory.GetFiles(RecordingsDir, "*.mp4", SearchOption.TopDirectoryOnly);
+                    var candidates = new List<string>();
+                    for (int i = 0; i < files.Length; i++)
+                    {
+                        string f = files[i];
+                        string n = Path.GetFileName(f);
+                        if (n.EndsWith("_repaired.mp4", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (n.EndsWith(".broken", StringComparison.OrdinalIgnoreCase)) continue;
+                        candidates.Add(f);
+                    }
+
+                    for (int i = 0; i < candidates.Count; i++)
+                    {
+                        string file = candidates[i];
+                        checkedCount++;
+                        _repairStatus = string.Format("Repairing {0}/{1}: {2}", checkedCount, candidates.Count, Path.GetFileName(file));
+
+                        bool ok = RepairFileInPlace(file, 15000);
+                        if (ok) repairedCount++;
+                        else failedCount++;
+                    }
+
+                    _repairStatus = string.Format("Repair finished. Checked: {0}, repaired: {1}, failed: {2}", checkedCount, repairedCount, failedCount);
+                }
+                catch (Exception ex)
+                {
+                    _repairStatus = "Repair failed: " + ex.Message;
+                    Debug.LogWarning("[VCR] RepairExistingRecordings exception: " + ex.Message);
+                }
+                finally
+                {
+                    _repairRunning = false;
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "VCR-RepairExisting"
+            }.Start();
+        }
+
+        private bool RepairFileInPlace(string inputPath, int timeoutMs)
+        {
+            if (string.IsNullOrEmpty(inputPath) || !File.Exists(inputPath))
+                return false;
+
+            string dir = Path.GetDirectoryName(inputPath) ?? RecordingsDir;
+            string name = Path.GetFileNameWithoutExtension(inputPath);
+            string ext = Path.GetExtension(inputPath);
+            string repairedPath = Path.Combine(dir, name + "_repaired" + ext);
+
+            var psi = new ProcessStartInfo(
+                FfmpegPath,
+                string.Format("-err_detect ignore_err -i \"{0}\" -c copy -movflags +faststart -y \"{1}\"", inputPath, repairedPath))
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                RedirectStandardInput = true,
+            };
+
+            using (var fix = Process.Start(psi))
+            {
+                if (fix == null)
+                {
+                    Debug.LogWarning("[VCR] Recovery FFmpeg process failed to start for: " + inputPath);
+                    return false;
+                }
+
+                string stdErr = fix.StandardError.ReadToEnd();
+                string stdOut = fix.StandardOutput.ReadToEnd();
+                bool done = fix.WaitForExit(timeoutMs);
+
+                if (!done)
+                {
+                    try { fix.StandardInput.WriteLine("q"); } catch { }
+                    done = fix.WaitForExit(5000);
+                    if (!done)
+                    {
+                        Debug.LogWarning("[VCR] Recovery timed out for: " + inputPath + " (soft-close only, no kill)");
+                        return false;
+                    }
+                }
+
+                if (fix.ExitCode != 0 || !File.Exists(repairedPath))
+                {
+                    Debug.LogWarning("[VCR] Recovery failed for " + inputPath + ". Exit=" + fix.ExitCode + " err=" + stdErr);
+                    return false;
+                }
+
+                long newSize = new FileInfo(repairedPath).Length;
+                if (newSize <= 0)
+                {
+                    try { File.Delete(repairedPath); } catch { }
+                    Debug.LogWarning("[VCR] Recovery output empty for: " + inputPath);
+                    return false;
+                }
+
+                string backupPath = inputPath + ".broken";
+                try
+                {
+                    if (File.Exists(backupPath)) File.Delete(backupPath);
+                    File.Move(inputPath, backupPath);
+                    File.Move(repairedPath, inputPath);
+                    Debug.Log("[VCR] Repaired existing file: " + inputPath + " backup=" + backupPath);
+                }
+                catch (Exception moveEx)
+                {
+                    Debug.LogWarning("[VCR] Recovery move failed for " + inputPath + ": " + moveEx.Message);
+                    return false;
+                }
+
+                if (!string.IsNullOrEmpty(stdOut))
+                    Debug.Log("[VCR] Recovery output: " + stdOut);
+
+                return true;
+            }
         }
 
         // ── AppLauncher toolbar button ─────────────────────────────────

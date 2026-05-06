@@ -2,7 +2,7 @@ using UnityEngine;
 
 namespace VirtualCameraRecorder
 {
-    internal sealed class MainCameraCaptureHook : MonoBehaviour
+    internal sealed class MainCameraBlitCapture : MonoBehaviour
     {
         public RenderTexture Target;
 
@@ -14,4 +14,3 @@ namespace VirtualCameraRecorder
         }
     }
 }
-

@@ -72,6 +72,7 @@
     <Compile Include="CameraWindow.cs" />
     <Compile Include="Class1.cs" />
     <Compile Include="FrameStreamer.cs" />
+    <Compile Include="MainCameraBlitCapture.cs" />
     <Compile Include="MainCameraCaptureHook.cs" />
     <Compile Include="ModLoader.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
